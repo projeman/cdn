@@ -210,6 +210,28 @@ func (s *TokenStore) Revoke(id string) (bool, error) {
 	return true, nil
 }
 
+// RevokeBucket deletes every dynamic token of bucketName and returns how many
+// there were. It exists for bucket deletion: without it the tokens (and the
+// quota) outlive the bucket and would silently apply to a new bucket that later
+// reuses the name.
+func (s *TokenStore) RevokeBucket(bucketName string) (int, error) {
+	infos, err := s.List(bucketName)
+	if err != nil {
+		return 0, err
+	}
+	revoked := 0
+	for _, info := range infos {
+		ok, err := s.Revoke(info.ID)
+		if err != nil {
+			return revoked, err
+		}
+		if ok {
+			revoked++
+		}
+	}
+	return revoked, nil
+}
+
 // --- Redis backend ---------------------------------------------------------
 
 type redisTokenBackend struct {

@@ -149,3 +149,24 @@ func TestTokenStoreListNeverExposesSecret(t *testing.T) {
 		t.Fatal("list output must carry neither the secret nor its digest")
 	}
 }
+
+func TestTokenStoreRevokeBucket(t *testing.T) {
+	s := NewTokenStore(newMemBackend())
+	a, _, _ := s.Create("gone", "a", time.Time{})
+	b, _, _ := s.Create("gone", "b", time.Time{})
+	keep, _, _ := s.Create("kept", "c", time.Time{})
+
+	n, err := s.RevokeBucket("gone")
+	if err != nil || n != 2 {
+		t.Fatalf("RevokeBucket = %d, %v; want 2, nil", n, err)
+	}
+	if s.Matches("gone", a) || s.Matches("gone", b) {
+		t.Fatal("tokens of a deleted bucket must stop working")
+	}
+	if !s.Matches("kept", keep) {
+		t.Fatal("other buckets' tokens must be untouched")
+	}
+	if n, _ := s.RevokeBucket("gone"); n != 0 {
+		t.Fatalf("second RevokeBucket = %d, want 0", n)
+	}
+}

@@ -58,5 +58,13 @@ func (m minioHandler) RemoveBucket(c *fiber.Ctx) error {
 	if err != nil {
 		return service.Response(c, fiber.StatusOK, false, err.Error(), bucketName)
 	}
+	// Credentials and limits belong to the bucket. Left behind, they would apply
+	// to any new bucket that reuses the name.
+	if t := service.DynamicTokens(); t != nil {
+		_, _ = t.RevokeBucket(bucketName)
+	}
+	if q := service.Quotas(); q != nil {
+		_ = q.ClearLimit(bucketName)
+	}
 	return service.Response(c, fiber.StatusOK, true, "bucket deleted", bucketName)
 }
