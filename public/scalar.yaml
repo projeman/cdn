@@ -95,6 +95,21 @@ components:
           endpoints and only for its own bucket (403 otherwise). Rejected on
           `/aws/*`, `/minio/*`, `/monitor`, `/metrics` and `/ws`.
   schemas:
+    TokenInfo:
+      type: object
+      properties:
+        id:
+          type: string
+        bucket:
+          type: string
+        label:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
     Error:
       type: object
       properties:
@@ -973,6 +988,280 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /list/{bucket}:
+    get:
+      summary: List objects in a bucket
+      description: >-
+        Authenticated, unlike object reads. A bucket-scoped token lists its own
+        bucket only (403 otherwise) and may call `/list` without a bucket. Results
+        are paged: pass `next_after` from one page as `after` on the next.
+      tags:
+        - File
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: bucket
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: prefix
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: Page size, 1-1000.
+          schema:
+            type: integer
+            default: 100
+        - name: after
+          in: query
+          description: Resume after this key.
+          schema:
+            type: string
+        - name: recursive
+          in: query
+          description: Set to `false` to list one folder level; sub-folders come back with `is_dir`.
+          schema:
+            type: boolean
+            default: true
+      responses:
+        "200":
+          description: One page of objects
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      bucket:
+                        type: string
+                      count:
+                        type: integer
+                      truncated:
+                        type: boolean
+                      next_after:
+                        type: string
+                      items:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            key:
+                              type: string
+                            size:
+                              type: integer
+                            last_modified:
+                              type: string
+                              format: date-time
+                            is_dir:
+                              type: boolean
+                            url:
+                              type: string
+        "403":
+          description: Token is scoped to a different bucket
+        "404":
+          description: Bucket not found
+  /minio/{bucket}/quota:
+    put:
+      summary: Set a bucket's storage quota
+      description: >-
+        Caps the total size of the bucket. Uploads that would exceed it are
+        refused with 413. Usage is counted from the bucket's contents and cached
+        for up to 5 minutes, so changes made outside this API show up within that
+        window. Concurrent uploads can overshoot slightly. Requires the general token.
+      tags:
+        - Minio
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: bucket
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [limit]
+              properties:
+                limit:
+                  type: string
+                  example: 500MB
+                  description: Size with optional K/M/G/T suffix (binary units), or a byte count.
+      responses:
+        "200":
+          description: Quota set
+        "400":
+          description: Invalid size or bucket name
+        "404":
+          description: Bucket not found
+    get:
+      summary: Read a bucket's quota and current usage
+      description: Pass `refresh=true` to recount instead of using the cached usage.
+      tags:
+        - Minio
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: bucket
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: refresh
+          in: query
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Limit, used, and percent
+        "404":
+          description: No quota set for this bucket
+    delete:
+      summary: Remove a bucket's quota (unlimited)
+      tags:
+        - Minio
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: bucket
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Quota removed
+  /minio/quotas:
+    get:
+      summary: List all configured quotas
+      tags:
+        - Minio
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Bucket limits, without measuring usage
+  /minio/{bucket}/token:
+    post:
+      summary: Create a bucket-scoped token
+      description: >-
+        Mints a token that can upload to and delete from this bucket only. The
+        secret is returned once, in this response, and cannot be retrieved later.
+        Use the returned `token` value as `Authorization: Bearer <token>`. Requires
+        the general token; a bucket-scoped token is rejected.
+      tags:
+        - Minio
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: bucket
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                  maxLength: 100
+                  description: Free-text note, e.g. which application uses the token.
+                expires_at:
+                  type: string
+                  format: date-time
+                  description: RFC 3339 timestamp. Omit for a token that never expires.
+      responses:
+        "201":
+          description: Token created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    type: object
+                    properties:
+                      token:
+                        type: string
+                        description: Ready-to-use bearer value, `<bucket>:<secret>`.
+                      secret:
+                        type: string
+                      info:
+                        $ref: "#/components/schemas/TokenInfo"
+        "400":
+          description: Invalid bucket name, label or expires_at
+        "404":
+          description: Bucket does not exist
+  /minio/tokens:
+    get:
+      summary: List bucket-scoped tokens
+      description: >-
+        Returns token metadata only. Secrets are never included. Requires the
+        general token.
+      tags:
+        - Minio
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: bucket
+          in: query
+          required: false
+          description: Only list tokens of this bucket.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Token list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TokenInfo"
+  /minio/tokens/{id}:
+    delete:
+      summary: Revoke a bucket-scoped token
+      description: Takes effect immediately on every replica. Requires the general token.
+      tags:
+        - Minio
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Token revoked
+        "404":
+          description: Token not found
   /aws/bucket-list:
     get:
       summary: List AWS buckets

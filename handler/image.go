@@ -109,6 +109,53 @@ func acquireOptimizeSlot() func() {
 	return func() { <-optimizeSem }
 }
 
+// bucketUsage sums the size of every object in bucket. It is the slow path of the
+// quota check and runs at most once per usage-cache lifetime per bucket.
+func (i image) bucketUsage(ctx context.Context, bucket string) (int64, error) {
+	var total int64
+	for obj := range i.minioClient.ListObjects(ctx, bucket, minio.ListObjectsOptions{Recursive: true}) {
+		if obj.Err != nil {
+			return 0, obj.Err
+		}
+		total += obj.Size
+	}
+	return total, nil
+}
+
+// putObject is the one way this handler writes to MinIO. It refuses the write when
+// it would push the bucket past its quota and keeps the cached usage in step with
+// what was written. Buckets without a quota pay nothing for this.
+func (i image) putObject(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
+	q := service.Quotas()
+	if q != nil {
+		err := q.Check(bucket, size, func() (int64, error) { return i.bucketUsage(ctx, bucket) })
+		if err != nil {
+			return minio.UploadInfo{}, err
+		}
+	}
+	info, err := i.minioClient.PutObject(ctx, bucket, object, r, size, opts)
+	if err == nil && q != nil {
+		q.AddUsed(bucket, size)
+	}
+	return info, err
+}
+
+// forgetUsage drops the cached usage after a delete so the next upload recounts.
+func (i image) forgetUsage(bucket string) {
+	if q := service.Quotas(); q != nil {
+		q.InvalidateUsed(bucket)
+	}
+}
+
+// uploadFailure maps a storage error to the response status: a full quota is the
+// caller's to fix with a 413, anything else keeps its previous 400.
+func uploadFailure(err error) int {
+	if errors.Is(err, service.ErrQuotaExceeded) {
+		return fiber.StatusRequestEntityTooLarge
+	}
+	return fiber.StatusBadRequest
+}
+
 // archiveObject copies a freshly stored object into the cold tier and reports
 // what happened, as a string suitable for the upload response.
 //
@@ -699,11 +746,11 @@ func (i image) UploadImage(c *fiber.Ctx) error {
 	}
 
 	// Minio Upload
-	_, err = i.minioClient.PutObject(ctx, bucket, objectName, fileBuffer, fileSize, minio.PutObjectOptions{ContentType: contentType})
+	_, err = i.putObject(ctx, bucket, objectName, fileBuffer, fileSize, minio.PutObjectOptions{ContentType: contentType})
 	minioResult := "Minio Successfully Uploaded"
 
 	if err != nil {
-		return service.Response(c, fiber.StatusBadRequest, false, err.Error(), nil)
+		return service.Response(c, uploadFailure(err), false, err.Error(), nil)
 	}
 
 	url := config.GetEnvOrDefault("APP_URL", "http://localhost:9090")
@@ -838,9 +885,9 @@ func (i image) UploadWithUrl(c *fiber.Ctx) error {
 	contentReader := bytes.NewReader(content)
 
 	// Upload with PutObject
-	minioResult, err := i.minioClient.PutObject(ctx, req.Bucket, objectName, contentReader, int64(len(content)), minio.PutObjectOptions{ContentType: contentType})
+	minioResult, err := i.putObject(ctx, req.Bucket, objectName, contentReader, int64(len(content)), minio.PutObjectOptions{ContentType: contentType})
 	if err != nil {
-		return service.Response(c, fiber.StatusBadRequest, false, err.Error(), nil)
+		return service.Response(c, uploadFailure(err), false, err.Error(), nil)
 	}
 
 	url := config.GetEnvOrDefault("APP_URL", "http://localhost:9090")
@@ -897,6 +944,7 @@ func (i image) DeleteImage(c *fiber.Ctx) error {
 	if err := i.minioClient.RemoveObject(ctx, bucket, object, minio.RemoveObjectOptions{}); err != nil {
 		return service.Response(c, fiber.StatusInternalServerError, false, err.Error(), "")
 	}
+	i.forgetUsage(bucket)
 
 	// Remove object from AWS S3 if required
 	if awsDelete {
@@ -1163,7 +1211,7 @@ func (i *image) BatchUpload(c *fiber.Ctx) error {
 			}
 
 			// Upload to MinIO
-			_, err = i.minioClient.PutObject(
+			_, err = i.putObject(
 				context.Background(),
 				bucketName,
 				objectName,
@@ -1270,6 +1318,7 @@ func (i *image) BatchDelete(c *fiber.Ctx) error {
 
 			// Delete from MinIO
 			err := i.minioClient.RemoveObject(context.Background(), req.Bucket, filename, minio.RemoveObjectOptions{})
+			i.forgetUsage(req.Bucket)
 			if err != nil {
 				result["success"] = false
 				result["error"] = err.Error()

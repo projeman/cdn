@@ -66,10 +66,15 @@ func ResolvePrincipal(c *fiber.Ctx) (Principal, error) {
 	}
 
 	name, secret, found := strings.Cut(strings.TrimSpace(raw), ":")
-	if !found || !config.BucketTokenMatches(name, secret) {
+	if !found {
 		return Principal{}, ErrInvalidToken
 	}
-	return Principal{Scoped: true, Bucket: name}, nil
+	// File tokens first, then tokens created at runtime through the API.
+	if config.BucketTokenMatches(name, secret) ||
+		(dynamicTokens != nil && dynamicTokens.Matches(name, secret)) {
+		return Principal{Scoped: true, Bucket: name}, nil
+	}
+	return Principal{}, ErrInvalidToken
 }
 
 // StorePrincipal records p on the request context for downstream handlers.

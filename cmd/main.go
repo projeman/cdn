@@ -36,6 +36,9 @@ var (
 	imageHandler   handler.Image
 	awsHandler     handler.AwsHandler
 	minioHandler   handler.MinioHandler
+	tokenHandler   handler.TokenHandler
+	listHandler    handler.ListHandler
+	quotaHandler   handler.QuotaHandler
 	wsHandler      handler.WebSocketHandler
 	archiveHandler handler.ArchiveHandler
 )
@@ -194,6 +197,21 @@ func main() {
 	minioHandler = handler.NewMinioHandler(minioClient)
 	wsHandler = handler.NewWebSocketHandler(statsService)
 
+	// Runtime tokens live in Redis so every replica sees creates and revokes.
+	tokenBackend, err := service.NewRedisTokenBackend()
+	if err != nil {
+		logger.Fatal().Err(err).Msg("token store backend")
+	}
+	tokenStore := service.NewTokenStore(tokenBackend)
+	service.SetTokenStore(tokenStore)
+	tokenHandler = handler.NewTokenHandler(tokenStore, minioClient)
+	listHandler = handler.NewListHandler(objectStore)
+
+	// Per-bucket storage quotas share the token store's Redis backend.
+	quotaStore := service.NewQuotaStore(tokenBackend)
+	service.SetQuotaStore(quotaStore)
+	quotaHandler = handler.NewQuotaHandler(objectStore, quotaStore)
+
 	// Per-connection header read buffer. 24MB was excessive (memory amplification
 	// under many connections); bound it to a sane, configurable size. This caps
 	// request-header size, not the body (BodyLimit handles that).
@@ -318,6 +336,17 @@ func main() {
 	io.Get("/:bucket/create", minioHandler.CreateBucket)
 	io.Delete("/:bucket/delete", minioHandler.RemoveBucket)
 
+	// Runtime bucket-scoped tokens (general token only, see TokenHandler).
+	io.Post("/:bucket/token", tokenHandler.Create)
+	io.Get("/tokens", tokenHandler.List)
+	io.Delete("/tokens/:id", tokenHandler.Revoke)
+
+	// Per-bucket storage quotas (general token only).
+	io.Get("/quotas", quotaHandler.List)
+	io.Put("/:bucket/quota", quotaHandler.Set)
+	io.Get("/:bucket/quota", quotaHandler.Get)
+	io.Delete("/:bucket/quota", quotaHandler.Clear)
+
 	// resize
 	// Auth-gated: /resize feeds arbitrary request bytes straight into ImageMagick
 	// (decode + resize), so it must not be an unauthenticated compute/attack
@@ -331,6 +360,16 @@ func main() {
 	// Not gated by DISABLE_DELETE: the object stays readable at the same URL
 	// afterwards, so this is a move between tiers rather than a deletion.
 	app.Post("/archive", BucketAuthMiddleware, archiveHandler.ArchiveObjects)
+
+	// Object listing: authenticated, registered before the /:bucket/* wildcard so
+	// "list" is not read as a bucket name.
+	app.Get("/list", BucketAuthMiddleware, listHandler.ListObjects)
+	app.Get("/list/:bucket", BucketAuthMiddleware, listHandler.ListObjects)
+
+	// Index
+	app.Get("/apidoc", func(c *fiber.Ctx) error {
+		return c.SendFile("./public/scalar.html")
+	})
 
 	// Minio
 	if !disableGet {
@@ -366,11 +405,6 @@ func main() {
 		uploadGroup.Post("/upload-url", BucketAuthMiddleware, imageHandler.UploadWithUrl)
 		uploadGroup.Post("/batch/upload", BucketAuthMiddleware, imageHandler.BatchUpload)
 	}
-
-	// Index
-	app.Get("/", func(c *fiber.Ctx) error {
-		return c.SendFile("./public/scalar.html")
-	})
 
 	// Graceful shutdown setup
 	shutdownChan := make(chan os.Signal, 1)

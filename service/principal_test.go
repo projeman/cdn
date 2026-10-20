@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/mstgnz/cdn/pkg/config"
@@ -223,5 +224,39 @@ func TestPrincipalLocalsRoundTrip(t *testing.T) {
 	}
 	if !fromStored.Scoped || fromStored.Bucket != "tedarik" {
 		t.Errorf("stored principal = %+v, want {true tedarik}", fromStored)
+	}
+}
+
+// A token created at runtime must authenticate like a file token, and stop the
+// moment it is revoked.
+func TestResolvePrincipalDynamicToken(t *testing.T) {
+	t.Setenv("TOKEN", "the-general-token")
+	loadTestTokens(t)
+	store := NewTokenStore(newMemBackend())
+	SetTokenStore(store)
+	t.Cleanup(func() { SetTokenStore(nil) })
+
+	secret, rec, err := store.Create("test", "panel", time.Time{})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	p, err := resolve(t, "Bearer test:"+secret)
+	if err != nil || !p.Scoped || p.Bucket != "test" {
+		t.Fatalf("dynamic token: principal=%+v err=%v", p, err)
+	}
+	if _, err := resolve(t, "Bearer tedarik:"+secret); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("dynamic token must not work on another bucket, got %v", err)
+	}
+	// File tokens keep working next to dynamic ones.
+	if p, err := resolve(t, "Bearer tedarik:"+testBucketSecret); err != nil || p.Bucket != "tedarik" {
+		t.Fatalf("file token broken by dynamic store: %+v %v", p, err)
+	}
+
+	if _, err := store.Revoke(rec.ID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, err := resolve(t, "Bearer test:"+secret); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("revoked token still accepted: %v", err)
 	}
 }
